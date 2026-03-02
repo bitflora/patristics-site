@@ -788,6 +788,8 @@ function renderVizTab() {
     vizViewEl.innerHTML = '<p class="no-refs" style="padding:.5rem 0">No categories selected.</p>';
     return;
   }
+  renderWormtrail(cats, version);       // async, fills in after data loads
+  renderTopChaptersChart(cats);
   renderBibleHeatmap(cats);
   renderTopBooksChart(cats);
   renderWorksTimeline(cats);
@@ -834,8 +836,84 @@ function navigateToWork(workId) {
   loadWork(workId);   // Fetches and renders the work
 }
 
+// Navigate from viz to a specific chapter
+function navigateToChapter(slug, ch) {
+  activeBook = slug;
+  activeChapter = ch;
+  setMode('scripture');
+  loadChapter(slug, ch);
+}
+
 // Fixed-point helper for SVG coords
 function f(n) { return n.toFixed(2); }
+
+// ── 0. Top Chapters Bar Chart ─────────────────────────────────────────────────
+function renderTopChaptersChart(cats) {
+  const sec = makeVizSection('Most Cited Chapters');
+  const desc = document.createElement('p');
+  desc.className = 'viz-desc';
+  desc.textContent = 'Each bar is one Bible chapter. Color shows authorship period. Click to browse its citations.';
+  sec.appendChild(desc);
+
+  const colors = getCatColors();
+
+  const chapterData = [];
+  for (const book of index.books) {
+    for (const ch of book.chapters) {
+      const byCat = {};
+      let total = 0;
+      for (const [cat, n] of Object.entries(ch.by_cat || {})) {
+        if (cats.has(cat)) { byCat[cat] = (byCat[cat] || 0) + n; total += n; }
+      }
+      if (total > 0) {
+        chapterData.push({ label: `${book.name} ${ch.ch}`, slug: book.slug, ch: ch.ch, total, byCat });
+      }
+    }
+  }
+  chapterData.sort((a, b) => b.total - a.total);
+  const top = chapterData.slice(0, 30);
+
+  if (!top.length) { sec.innerHTML += '<p class="no-refs">No data.</p>'; return; }
+
+  const maxVal = top[0].total;
+  const allCats = [...cats].sort();
+  const ROW_H = 28, LBL_W = 145, BAR_MAX = 380, SVG_W = LBL_W + BAR_MAX + 55;
+  const SVG_H = top.length * ROW_H + 8;
+
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}">`];
+
+  for (let i = 0; i < top.length; i++) {
+    const item = top[i];
+    const y = i * ROW_H + 4;
+    const label = item.label.length > 20 ? item.label.slice(0, 19) + '…' : item.label;
+    s.push(`<text x="${LBL_W - 6}" y="${y + 14}" class="viz-bar-label" text-anchor="end">${esc(label)}</text>`);
+
+    let xOff = LBL_W;
+    for (const cat of allCats) {
+      const n = item.byCat[cat] || 0;
+      if (!n) continue;
+      const w = Math.max(1, (n / maxVal) * BAR_MAX);
+      const col = colors.get(cat) || '#7a5c38';
+      s.push(`<rect x="${f(xOff)}" y="${y}" width="${f(w)}" height="18" fill="${col}" rx="2"><title>${esc(cat)}: ${n}</title></rect>`);
+      xOff += w;
+    }
+    // Invisible hit target for click-to-navigate
+    const totalW = Math.max(1, (item.total / maxVal) * BAR_MAX);
+    s.push(`<rect x="${LBL_W}" y="${y}" width="${f(totalW)}" height="18" fill="transparent" class="viz-bar-hit" data-slug="${esc(item.slug)}" data-ch="${item.ch}"/>`);
+    s.push(`<text x="${f(LBL_W + (item.total / maxVal) * BAR_MAX + 5)}" y="${y + 14}" class="viz-bar-count">${item.total}</text>`);
+  }
+  s.push('</svg>');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'viz-chart-wrap';
+  wrap.innerHTML = s.join('');
+  wrap.querySelector('svg').addEventListener('click', e => {
+    const hit = e.target.closest('[data-slug]');
+    if (hit) navigateToChapter(hit.getAttribute('data-slug'), +hit.getAttribute('data-ch'));
+  });
+  sec.appendChild(wrap);
+  sec.appendChild(buildCatLegend(allCats, colors));
+}
 
 // ── 1. Bible Coverage Heatmap ─────────────────────────────────────────────────
 function renderBibleHeatmap(cats) {
@@ -1224,7 +1302,189 @@ async function renderBibleRefsByDate(cats, version) {
   sec.appendChild(legend);
 }
 
-// ── 5. Category Donut ─────────────────────────────────────────────────────────
+// ── 5. Citation Wormtrail (Streamgraph) ───────────────────────────────────────
+
+const WORM_TOP_N = 20; // most-cited books to show
+
+async function renderWormtrail(cats, version) {
+  const sec = makeVizSection('Citation Wormtrail');
+
+  const worksWithYear = index.works
+    .filter(w => w.year != null && cats.has(w.category || 'Other'));
+
+  if (!worksWithYear.length) {
+    sec.appendChild(Object.assign(document.createElement('p'),
+      { className: 'no-refs', textContent: 'No dated works in the selected categories.' }));
+    return;
+  }
+
+  const uncachedCount = worksWithYear.filter(w => !workRefsCache.has(w.id)).length;
+  let loadingEl = null;
+  if (uncachedCount > 0) {
+    loadingEl = document.createElement('p');
+    loadingEl.className = 'loading';
+    loadingEl.textContent = `Loading citation data for ${uncachedCount} work${uncachedCount !== 1 ? 's' : ''}…`;
+    sec.appendChild(loadingEl);
+  }
+
+  const workRefsData = await Promise.all(
+    worksWithYear.map(async w => {
+      const refs = await fetchWorkRefs(w.id);
+      const bookCounts = new Map();
+      for (const ref of refs) {
+        bookCounts.set(ref.book_slug, (bookCounts.get(ref.book_slug) || 0) + 1);
+      }
+      return { work: w, bookCounts };
+    })
+  );
+
+  if (_vizVersion !== version) return;
+  if (loadingEl) loadingEl.remove();
+
+  const minYear  = Math.min(...worksWithYear.map(w => w.year));
+  const maxYear  = Math.max(...worksWithYear.map(w => w.year));
+  const yearSpan = maxYear - minYear;
+  const BUCKET   = yearSpan < 200 ? 25 : yearSpan < 500 ? 50 : yearSpan < 1000 ? 100 : yearSpan < 2000 ? 200 : 500;
+
+  // Non-empty buckets only
+  const firstBucket = Math.floor(minYear / BUCKET) * BUCKET;
+  const bucketKeys = [];
+  for (let b = firstBucket; b <= maxYear; b += BUCKET) {
+    if (workRefsData.some(d => d.work.year >= b && d.work.year < b + BUCKET))
+      bucketKeys.push(b);
+  }
+
+  if (!bucketKeys.length) {
+    sec.appendChild(Object.assign(document.createElement('p'),
+      { className: 'no-refs', textContent: 'No data.' }));
+    return;
+  }
+
+  // Build grid: book_slug → Map(bucketKey → count)
+  const grid = new Map();
+  for (const { work, bookCounts } of workRefsData) {
+    const b = Math.floor(work.year / BUCKET) * BUCKET;
+    if (!bucketKeys.includes(b)) continue;
+    for (const [slug, n] of bookCounts) {
+      if (!grid.has(slug)) grid.set(slug, new Map());
+      grid.get(slug).set(b, (grid.get(slug).get(b) || 0) + n);
+    }
+  }
+
+  // Top N books by total citations, preserved in canonical order
+  const bookTotals = new Map(
+    [...grid.entries()].map(([slug, m]) => [slug, [...m.values()].reduce((s, n) => s + n, 0)])
+  );
+  const topSlugs = new Set(
+    [...bookTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, WORM_TOP_N).map(([s]) => s)
+  );
+  const books = index.books.filter(b => topSlugs.has(b.slug));
+
+  if (!books.length) {
+    sec.appendChild(Object.assign(document.createElement('p'),
+      { className: 'no-refs', textContent: 'No data.' }));
+    return;
+  }
+
+  const desc = document.createElement('p');
+  desc.className = 'viz-desc';
+  desc.textContent = `Flowing citation share of the top ${books.length} most-cited Bible books across ${BUCKET}-year periods. Stream width reflects citation volume. Click a stream to explore that book.`;
+  sec.insertBefore(desc, sec.firstChild.nextSibling);
+
+  // Per-bucket totals (for the shown books only)
+  const N = bucketKeys.length;
+  const bucketTotals = bucketKeys.map(b =>
+    books.reduce((s, bk) => s + (grid.get(bk.slug)?.get(b) || 0), 0)
+  );
+  const maxTotal = Math.max(...bucketTotals, 1);
+
+  const SVG_W = 680, SVG_H = 320;
+  const PAD_L = 8, PAD_R = 8, PAD_T = 10, PAD_B = 24;
+  const PLOT_W = SVG_W - PAD_L - PAD_R;
+  const PLOT_H = SVG_H - PAD_T - PAD_B;
+  const centerY = PAD_T + PLOT_H / 2;
+
+  // X position for each bucket (spread evenly)
+  const xs = bucketKeys.map((_, i) =>
+    N === 1 ? PAD_L + PLOT_W / 2 : PAD_L + (i / (N - 1)) * PLOT_W
+  );
+
+  // Silhouette layout: stack books, centered around centerY
+  // tops[bi][ci] = upper SVG y, bots[bi][ci] = lower SVG y
+  const tops = books.map(() => new Array(N).fill(0));
+  const bots = books.map(() => new Array(N).fill(0));
+  for (let ci = 0; ci < N; ci++) {
+    const total = bucketTotals[ci];
+    const scale = PLOT_H / maxTotal;
+    let y = centerY - (total * scale / 2);
+    for (let bi = 0; bi < books.length; bi++) {
+      const h = (grid.get(books[bi].slug)?.get(bucketKeys[ci]) || 0) * scale;
+      tops[bi][ci] = y;
+      bots[bi][ci] = y + h;
+      y += h;
+    }
+  }
+
+  // Build a cubic-bezier smooth SVG area path for one stream
+  function streamPath(top, bot) {
+    if (N === 1) {
+      const x = xs[0];
+      return `M ${f(x - 4)},${f(top[0])} L ${f(x + 4)},${f(top[0])} L ${f(x + 4)},${f(bot[0])} L ${f(x - 4)},${f(bot[0])} Z`;
+    }
+    // Top edge left → right
+    let d = `M ${f(xs[0])},${f(top[0])}`;
+    for (let i = 1; i < N; i++) {
+      const mx = f((xs[i - 1] + xs[i]) / 2);
+      d += ` C ${mx},${f(top[i - 1])} ${mx},${f(top[i])} ${f(xs[i])},${f(top[i])}`;
+    }
+    // Bottom edge right → left
+    d += ` L ${f(xs[N - 1])},${f(bot[N - 1])}`;
+    for (let i = N - 2; i >= 0; i--) {
+      const mx = f((xs[i] + xs[i + 1]) / 2);
+      d += ` C ${mx},${f(bot[i + 1])} ${mx},${f(bot[i])} ${f(xs[i])},${f(bot[i])}`;
+    }
+    return d + ' Z';
+  }
+
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" style="font-family:Georgia,serif">`];
+
+  // Streams
+  for (let bi = 0; bi < books.length; bi++) {
+    const bk    = books[bi];
+    const color = BOOK_GROUP_COLORS.get(BOOK_GROUP_MAP.get(bk.slug) ?? 'Deuterocanon') || '#888';
+    const total = bookTotals.get(bk.slug) || 0;
+    const d     = streamPath(tops[bi], bots[bi]);
+    s.push(`<path d="${d}" fill="${color}" fill-opacity="0.82" stroke="var(--bg,#fff)" stroke-width="0.6" style="cursor:pointer" onclick="navigateToBook('${bk.slug}')"><title>${esc(bk.name)}: ${total.toLocaleString()} refs total</title></path>`);
+  }
+
+  // Labels at each stream's widest bucket
+  for (let bi = 0; bi < books.length; bi++) {
+    let bestCi = 0, bestH = 0;
+    for (let ci = 0; ci < N; ci++) {
+      const h = bots[bi][ci] - tops[bi][ci];
+      if (h > bestH) { bestH = h; bestCi = ci; }
+    }
+    if (bestH < 9) continue;
+    const lx = xs[bestCi];
+    const ly = (tops[bi][bestCi] + bots[bi][bestCi]) / 2;
+    const label = books[bi].name.length > 9 ? books[bi].name.slice(0, 8) + '\u2026' : books[bi].name;
+    s.push(`<text x="${f(lx)}" y="${f(ly + 2.5)}" text-anchor="middle" font-size="7" fill="rgba(0,0,0,0.7)" pointer-events="none">${esc(label)}</text>`);
+  }
+
+  // Year labels along the bottom
+  for (let ci = 0; ci < N; ci++) {
+    s.push(`<text x="${f(xs[ci])}" y="${f(SVG_H - 6)}" text-anchor="middle" font-size="8" fill="var(--muted)">${bucketKeys[ci]}</text>`);
+  }
+
+  s.push('</svg>');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'viz-chart-wrap';
+  wrap.innerHTML = s.join('');
+  sec.appendChild(wrap);
+}
+
+// ── 6. Category Donut ─────────────────────────────────────────────────────────
 function renderCategoryDonut(cats) {
   const sec = makeVizSection('Corpus by Category');
   const colors = getCatColors();
@@ -1305,6 +1565,13 @@ function buildCatLegend(allCats, colors) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+function dismissSpinner() {
+  const el = document.getElementById('spinner-overlay');
+  if (!el) return;
+  el.classList.add('fade-out');
+  el.addEventListener('transitionend', () => el.remove(), { once: true });
+}
+
 async function init() {
   try {
     index = await fetchJSON(`${DATA_ROOT}/index.json.zst`);
@@ -1313,6 +1580,7 @@ async function init() {
       Could not load index.json.<br>Run <code>python src/parser.py</code> then
       <code>go run ./cmd/builder</code> first.
     </p>`;
+    dismissSpinner();
     return;
   }
 
@@ -1324,6 +1592,7 @@ async function init() {
   renderSidebar();
   renderWorksList();
   setMode('viz');
+  passagesLoadPromise.then(dismissSpinner, dismissSpinner);
 }
 
 searchEl.addEventListener("input", () => renderSidebar(searchEl.value));
