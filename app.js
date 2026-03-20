@@ -13,6 +13,15 @@
 
 const DATA_ROOT = "data/static";
 
+// ── URL Hash Navigation ───────────────────────────────────────────────────────
+let _restoringFromHash = false;
+
+function pushNav(hash) {
+  if (_restoringFromHash) return;
+  if (location.hash === hash) return;
+  history.pushState(null, '', hash);
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let index = null;         // loaded from index.json.zst
 let worksById = new Map(); // manuscript id → work entry (from index)
@@ -142,7 +151,12 @@ function setMode(mode) {
 }
 
 for (const tab of modeTabEls)
-  tab.addEventListener("click", () => setMode(tab.dataset.mode));
+  tab.addEventListener("click", () => {
+    setMode(tab.dataset.mode);
+    if (tab.dataset.mode === 'viz') pushNav('#/viz');
+    else if (tab.dataset.mode === 'scripture') pushNav('#/scripture');
+    else if (tab.dataset.mode === 'works') pushNav('#/works');
+  });
 
 // ── Sidebar rendering ─────────────────────────────────────────────────────────
 function renderSidebar(filter = "") {
@@ -264,6 +278,7 @@ async function showVerseView(bookSlug, chapter) {
   activeBook    = bookSlug;
   activeChapter = chapter;
   activeVerse   = null;
+  pushNav(`#/scripture/${bookSlug}/${chapter}`);
   setMode('scripture');
   renderSidebar(searchEl.value);
 
@@ -361,6 +376,7 @@ function renderVerseTable(bookData, chData, kjvChapter) {
 
 async function loadChapterFiltered(bookData, chData, verseKey, kjvChapter) {
   activeVerse = verseKey;
+  pushNav(`#/scripture/${activeBook}/${activeChapter}/${verseKey}`);
 
   verseViewEl.hidden   = true;
   chapterViewEl.hidden = false;
@@ -408,6 +424,7 @@ async function loadChapterFiltered(bookData, chData, verseKey, kjvChapter) {
     card.className = "ref-card";
     card.dataset.author   = work.author;
     card.dataset.category = work.category || "Other";
+    card.style.borderLeft = `3px solid ${catColor(work.category || 'Other')}`;
 
     const verseTag = ref.v
       ? `<span class="ref-verse-tag">v.\u00a0${esc(ref.v)}</span>`
@@ -439,6 +456,7 @@ async function loadChapter(bookSlug, chapter) {
   activeBook    = bookSlug;
   activeChapter = chapter;
   activeVerse   = "all"; // special value: not null (verse table) but not a specific verse
+  pushNav(`#/scripture/${bookSlug}/${chapter}/all`);
   setMode('scripture');
   renderSidebar(searchEl.value);
 
@@ -492,6 +510,7 @@ function renderChapter(bookData, chData) {
     card.className = "ref-card";
     card.dataset.author = work.author;
     card.dataset.category = work.category || "Other";
+    card.style.borderLeft = `3px solid ${catColor(work.category || 'Other')}`;
 
     const verseTag = ref.v
       ? `<span class="ref-verse-tag">v. ${ref.v}</span>`
@@ -548,10 +567,20 @@ function renderCategoryFilters() {
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.value = cat;
-    cb.checked = true;
-    cb.addEventListener("change", applyFilters);
+    const saved = localStorage.getItem("hiddenCats");
+    const hidden = saved ? JSON.parse(saved) : [];
+    cb.checked = !hidden.includes(cat);
+    cb.addEventListener("change", () => {
+      const nowHidden = [...categoryFiltersEl.querySelectorAll("input[type=checkbox]")]
+        .filter(c => !c.checked).map(c => c.value);
+      localStorage.setItem("hiddenCats", JSON.stringify(nowHidden));
+      applyFilters();
+    });
+    const dot = document.createElement("span");
+    dot.style.cssText = `display:inline-block;width:8px;height:8px;border-radius:50%;background:${catColor(cat)};margin:0 4px 0 2px;vertical-align:middle;opacity:0.9;flex-shrink:0;`;
     label.appendChild(cb);
-    label.appendChild(document.createTextNode(" " + cat));
+    label.appendChild(dot);
+    label.appendChild(document.createTextNode(cat));
     categoryFiltersEl.appendChild(label);
   }
 }
@@ -602,10 +631,12 @@ function renderWorksList(filter = "") {
       ? `<span class="work-ref-badge">${work.ref_count.toLocaleString()}</span>`
       : "";
 
+    const categoryStr = work.category || "Other";
     btn.innerHTML = `
       <span class="work-btn-text">
         <span class="work-author">${esc(work.author)}</span>
         <span class="work-title-sm"> — ${esc(work.title)}${esc(yearStr)}</span>
+        <span class="work-category-tag" style="background:${catColor(categoryStr)}22;color:${catColor(categoryStr)};border-color:${catColor(categoryStr)}44">${esc(categoryStr)}</span>
       </span>
       ${badge}
     `;
@@ -619,6 +650,7 @@ worksSearchEl.addEventListener("input", () => renderWorksList(worksSearchEl.valu
 // ── Work loading ──────────────────────────────────────────────────────────────
 async function loadWork(workId) {
   activeWorkId = workId;
+  pushNav(`#/works/${workId}`);
   setMode('works');
   renderWorksList(worksSearchEl.value);
 
@@ -768,14 +800,30 @@ function highlightPassage(text, chapter, verseKey) {
 
 // ── Visualizations ────────────────────────────────────────────────────────────
 
-// Earthy palette that complements the app's warm brown theme
-const CAT_PALETTE = ['#7a5c38','#4a8c6a','#5c7aa8','#9a6b4b','#7a4a6a','#5c8a5c','#8a7a4a','#6a5c8a'];
+// Fixed per-category colors that complement the app's warm brown theme
+const CAT_COLORS = {
+  'Apologetics':         '#8a5a28',
+  'Biblical Commentary': '#5a7a28',
+  'Church History':      '#2a7878',
+  'Devotional':          '#8a3a68',
+  'Medieval':            '#6a4a8a',
+  'Other':               '#6a6a6a',
+  'Patristics':          '#8a3838',
+  'Puritan':             '#4a5a78',
+  'Reformation':         '#2a7a48',
+  'Scripture':           '#7a6818',
+  'Sermons':             '#8a6818',
+  'Systematic Theology': '#3a5888',
+};
 let _catColorMap = null;
+
+function catColor(cat) {
+  return CAT_COLORS[cat] || '#6a6a6a';
+}
 
 function getCatColors() {
   if (!_catColorMap) {
-    const cats = [...new Set(index.works.map(w => w.category || 'Other'))].sort();
-    _catColorMap = new Map(cats.map((c, i) => [c, CAT_PALETTE[i % CAT_PALETTE.length]]));
+    _catColorMap = new Map(Object.entries(CAT_COLORS));
   }
   return _catColorMap;
 }
@@ -1388,7 +1436,7 @@ async function renderWormtrail(cats, version) {
 
   const desc = document.createElement('p');
   desc.className = 'viz-desc';
-  desc.textContent = `Flowing citation share of the top ${books.length} most-cited Bible books across ${BUCKET}-year periods. Stream width reflects citation volume. Click a stream to explore that book.`;
+  desc.textContent = `Citation share of the top ${books.length} most-cited Bible books across ${BUCKET}-year periods. Each column shows the proportional distribution of citations in that era. Click a stream to explore that book.`;
   sec.insertBefore(desc, sec.firstChild.nextSibling);
 
   // Per-bucket totals (for the shown books only)
@@ -1396,7 +1444,6 @@ async function renderWormtrail(cats, version) {
   const bucketTotals = bucketKeys.map(b =>
     books.reduce((s, bk) => s + (grid.get(bk.slug)?.get(b) || 0), 0)
   );
-  const maxTotal = Math.max(...bucketTotals, 1);
 
   const SVG_W = 680, SVG_H = 320;
   const PAD_L = 8, PAD_R = 8, PAD_T = 10, PAD_B = 24;
@@ -1404,19 +1451,23 @@ async function renderWormtrail(cats, version) {
   const PLOT_H = SVG_H - PAD_T - PAD_B;
   const centerY = PAD_T + PLOT_H / 2;
 
-  // X position for each bucket (spread evenly)
-  const xs = bucketKeys.map((_, i) =>
-    N === 1 ? PAD_L + PLOT_W / 2 : PAD_L + (i / (N - 1)) * PLOT_W
+  // X position for each bucket: proportional to actual year value
+  const minBucket = bucketKeys[0];
+  const maxBucket = bucketKeys[N - 1];
+  const xs = bucketKeys.map(b =>
+    N === 1 ? PAD_L + PLOT_W / 2 : PAD_L + ((b - minBucket) / (maxBucket - minBucket)) * PLOT_W
   );
 
-  // Silhouette layout: stack books, centered around centerY
-  // tops[bi][ci] = upper SVG y, bots[bi][ci] = lower SVG y
+  // Silhouette layout: normalize each bucket to fill the full plot height,
+  // so early-era works (few refs) are as visible as later high-volume eras.
+  // This shows citation *share* (which books dominate each period) rather
+  // than absolute volume.
   const tops = books.map(() => new Array(N).fill(0));
   const bots = books.map(() => new Array(N).fill(0));
   for (let ci = 0; ci < N; ci++) {
-    const total = bucketTotals[ci];
-    const scale = PLOT_H / maxTotal;
-    let y = centerY - (total * scale / 2);
+    const total = bucketTotals[ci] || 1;
+    const scale = PLOT_H / total;
+    let y = centerY - PLOT_H / 2;
     for (let bi = 0; bi < books.length; bi++) {
       const h = (grid.get(books[bi].slug)?.get(bucketKeys[ci]) || 0) * scale;
       tops[bi][ci] = y;
@@ -1564,6 +1615,53 @@ function buildCatLegend(allCats, colors) {
   return div;
 }
 
+// ── Hash restoration ──────────────────────────────────────────────────────────
+async function restoreFromHash(hash) {
+  _restoringFromHash = true;
+  try {
+    if (!hash || hash === '#' || hash === '#/viz') {
+      setMode('viz');
+      return;
+    }
+
+    const m = hash.slice(1); // strip leading #
+
+    if (m.startsWith('/scripture/')) {
+      const parts = m.slice('/scripture/'.length).split('/');
+      const slug    = parts[0];
+      const chapter = parseInt(parts[1], 10);
+      const verseKey = parts[2]; // undefined | 'all' | 'whole' | '<n>'
+
+      if (!slug || isNaN(chapter)) { setMode('scripture'); return; }
+
+      if (verseKey === 'all') {
+        await loadChapter(slug, chapter);
+      } else if (verseKey) {
+        // Show the verse table first so the UI has a back destination, then the filtered view
+        await showVerseView(slug, chapter);
+        const bookData    = bookCache.get(slug);
+        const kjvChapter  = kjvData?.[slug]?.[String(chapter)] ?? null;
+        const chData      = bookData?.chapters.find(c => c.ch === chapter);
+        if (chData) await loadChapterFiltered(bookData, chData, verseKey, kjvChapter);
+      } else {
+        await showVerseView(slug, chapter);
+      }
+    } else if (m.startsWith('/works/')) {
+      const workId = parseInt(m.slice('/works/'.length), 10);
+      if (!isNaN(workId)) await loadWork(workId);
+      else setMode('works');
+    } else if (m === '/works') {
+      setMode('works');
+    } else if (m === '/scripture') {
+      setMode('scripture');
+    } else {
+      setMode('viz');
+    }
+  } finally {
+    _restoringFromHash = false;
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 function dismissSpinner() {
   const el = document.getElementById('spinner-overlay');
@@ -1591,7 +1689,15 @@ async function init() {
   renderCategoryFilters();
   renderSidebar();
   renderWorksList();
-  setMode('viz');
+
+  window.addEventListener('popstate', () => restoreFromHash(location.hash));
+
+  if (location.hash && location.hash !== '#') {
+    await restoreFromHash(location.hash);
+  } else {
+    setMode('viz');
+  }
+
   passagesLoadPromise.then(dismissSpinner, dismissSpinner);
 }
 
