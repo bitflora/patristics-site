@@ -5,6 +5,10 @@
  *   viewer/data/static/index.json.zst
  *   viewer/data/static/bible/{book-slug}/{chapter}.json.zst
  *   viewer/data/static/manuscripts/{id}.json.zst
+ *   viewer/data/static/kjv/{book-slug}.json.zst
+ * Chapter files carry passage text inline, so the Bible view costs one fetch.
+ * Work files carry only refs; their text is pulled from chapter files as
+ * cards scroll into view.
  *
  * To serve locally:
  *   python -m http.server 8000 --directory .   (from project root)
@@ -25,16 +29,13 @@ function pushNav(hash) {
 // ── State ─────────────────────────────────────────────────────────────────────
 let index = null;         // loaded from index.json.zst
 let worksById = new Map(); // manuscript id → work entry (from index)
-const bookCache = new Map(); // book slug → parsed book payload
+const chapterCache = new Map(); // "slug/ch" → promise of parsed chapter payload
 let activeBook = null;    // slug
 let activeChapter = null; // number
 let activeVerse = null;   // null = on verse table; "13" / "whole" = filtered citations view
 let activeMode = "viz";  // "scripture" | "works" | "viz"
 let activeWorkId = null;       // numeric manuscript id
-let kjvData = null;       // loaded lazily from kjv.json.zst
-let kjvLoadPromise = null;
-let passagesData = null;       // loaded lazily from passages.json.zst
-let passagesLoadPromise = null;
+const kjvCache = new Map(); // book slug → promise of {ch: {v: text}} (null if unavailable)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const bookListEl       = document.getElementById("book-list");
@@ -67,6 +68,22 @@ const modeTabEls       = document.querySelectorAll(".mode-tab");
 // Visualizations mode DOM ref
 const vizViewEl        = document.getElementById("viz-view");
 
+// ── Mobile sidebar toggle ─────────────────────────────────────────────────────
+const toggleBtn = document.createElement('button');
+toggleBtn.id = 'sidebar-toggle';
+toggleBtn.setAttribute('aria-label', 'Toggle navigation');
+toggleBtn.textContent = '☰';
+document.querySelector('header').appendChild(toggleBtn);
+
+const sidebarOverlay = document.createElement('div');
+sidebarOverlay.id = 'sidebar-overlay';
+document.getElementById('app').prepend(sidebarOverlay);
+
+function openSidebar()  { sidebarEl.classList.add('open'); sidebarOverlay.classList.add('visible'); }
+function closeSidebar() { sidebarEl.classList.remove('open'); sidebarOverlay.classList.remove('visible'); }
+toggleBtn.addEventListener('click', () => sidebarEl.classList.contains('open') ? closeSidebar() : openSidebar());
+sidebarOverlay.addEventListener('click', closeSidebar);
+
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
 async function fetchJSON(url) {
   const resp = await fetch(url);
@@ -79,6 +96,19 @@ async function fetchJSON(url) {
     return JSON.parse(new TextDecoder().decode(decompressed));
   }
   return resp.json();
+}
+
+// ── CCEL URL helpers ──────────────────────────────────────────────────────────
+
+// Build a chapter-level CCEL URL with an anchor pointing to the exact citation.
+// ccelUrl: e.g. "https://ccel.org/ccel/adeney/expositoreznehes"
+// anchor:  ThML scripRef id, e.g. "ii-p6.1" (null/undefined = fall back to work root)
+function ccelPageUrl(ccelUrl, anchor) {
+  if (!ccelUrl) return null;
+  if (!anchor) return ccelUrl;
+  const bookId = ccelUrl.split('/').pop();
+  const divId  = anchor.split('-p')[0];
+  return `${ccelUrl}/${bookId}.${divId}.html#fnf_${anchor}`;
 }
 
 // ── Heatmap ───────────────────────────────────────────────────────────────────
@@ -242,24 +272,23 @@ function showWelcome() {
 }
 
 // ── KJV text loading ──────────────────────────────────────────────────────────
-async function loadKJV() {
-  if (kjvData) return kjvData;
-  if (!kjvLoadPromise) {
-    kjvLoadPromise = fetchJSON(`${DATA_ROOT}/kjv.json.zst`)
-      .then(d => { kjvData = d; return d; })
-      .catch(() => null); // KJV text is optional; verse table still works without it
+function loadKJVBook(bookSlug) {
+  if (!kjvCache.has(bookSlug)) {
+    kjvCache.set(bookSlug, fetchJSON(`${DATA_ROOT}/kjv/${bookSlug}.json.zst`)
+      .catch(() => null)); // KJV text is optional; verse table still works without it
   }
-  return kjvLoadPromise;
+  return kjvCache.get(bookSlug);
 }
 
-// ── Passage text loading ───────────────────────────────────────────────────────
-async function loadPassages() {
-  if (passagesData) return passagesData;
-  if (!passagesLoadPromise) {
-    passagesLoadPromise = fetchJSON(`${DATA_ROOT}/passages.json.zst`)
-      .then(d => { passagesData = d; return d; });
+// ── Chapter data loading ──────────────────────────────────────────────────────
+function loadChapterData(bookSlug, chapter) {
+  const key = `${bookSlug}/${chapter}`;
+  if (!chapterCache.has(key)) {
+    const p = fetchJSON(`${DATA_ROOT}/bible/${key}.json.zst`);
+    p.catch(() => chapterCache.delete(key)); // allow a retry after a failed fetch
+    chapterCache.set(key, p);
   }
-  return passagesLoadPromise;
+  return chapterCache.get(key);
 }
 
 // ── Verse selection view ──────────────────────────────────────────────────────
@@ -286,25 +315,21 @@ async function showVerseView(bookSlug, chapter) {
   verseTitleEl.textContent = bookInfo ? `${bookInfo.name} ${chapter}` : `${bookSlug} ${chapter}`;
   verseTbodyEl.innerHTML = `<tr><td colspan="3" class="loading" style="padding:.75rem">Loading…</td></tr>`;
 
-  let bookData, kjv;
+  let chData, kjv;
   try {
-    [bookData, kjv] = await Promise.all([
-      bookCache.has(bookSlug)
-        ? Promise.resolve(bookCache.get(bookSlug))
-        : fetchJSON(`${DATA_ROOT}/bible/${bookSlug}.json.zst`).then(d => { bookCache.set(bookSlug, d); return d; }),
-      loadKJV(),
+    [chData, kjv] = await Promise.all([
+      loadChapterData(bookSlug, chapter),
+      loadKJVBook(bookSlug),
     ]);
   } catch (err) {
     verseTbodyEl.innerHTML = `<tr><td colspan="3" class="no-refs">Could not load chapter data.</td></tr>`;
     return;
   }
 
-  const chData = bookData.chapters.find(c => c.ch === chapter);
-  const kjvChapter = kjv?.[bookSlug]?.[String(chapter)] ?? null;
-  renderVerseTable(bookData, chData, kjvChapter);
+  renderVerseTable(chData, kjv?.[String(chapter)] ?? null);
 }
 
-function renderVerseTable(bookData, chData, kjvChapter) {
+function renderVerseTable(chData, kjvChapter) {
   verseTbodyEl.innerHTML = "";
 
   if (!chData || !chData.refs.length) {
@@ -367,21 +392,19 @@ function renderVerseTable(bookData, chData, kjvChapter) {
       <td class="verse-count-cell">${count}</td>
     `;
 
-    tr.addEventListener("click", () => loadChapterFiltered(bookData, chData, key, kjvChapter));
-    tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") loadChapterFiltered(bookData, chData, key, kjvChapter); });
+    tr.addEventListener("click", () => loadChapterFiltered(chData, key, kjvChapter));
+    tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") loadChapterFiltered(chData, key, kjvChapter); });
 
     verseTbodyEl.appendChild(tr);
   }
 }
 
-async function loadChapterFiltered(bookData, chData, verseKey, kjvChapter) {
+function loadChapterFiltered(chData, verseKey, kjvChapter) {
   activeVerse = verseKey;
   pushNav(`#/scripture/${activeBook}/${activeChapter}/${verseKey}`);
 
   verseViewEl.hidden   = true;
   chapterViewEl.hidden = false;
-
-  await loadPassages();
 
   // Update chapter title to include verse
   const bookInfo = index.books.find(b => b.slug === activeBook);
@@ -431,8 +454,9 @@ async function loadChapterFiltered(bookData, chData, verseKey, kjvChapter) {
       : `<span class="ref-verse-tag">whole chapter</span>`;
 
     const yearStr = work.year ? ` (${work.year})` : "";
-    const ccelLink = work.ccel_url
-      ? ` <a href="${esc(work.ccel_url)}" target="_blank" rel="noopener" class="ccel-link">View on CCEL ↗</a>`
+    const pageUrl = ccelPageUrl(work.ccel_url, ref.ca);
+    const ccelLink = pageUrl
+      ? ` <a href="${esc(pageUrl)}" target="_blank" rel="noopener" class="ccel-link">View on CCEL ↗</a>`
       : "";
 
     card.innerHTML = `
@@ -443,7 +467,7 @@ async function loadChapterFiltered(bookData, chData, verseKey, kjvChapter) {
         </div>
         ${verseTag}
       </div>
-      <div class="ref-text">${highlightPassage(passagesData[ref.p], activeChapter, ref.v)}</div>
+      <div class="ref-text">${highlightPassage(ref.t, activeChapter, ref.v)}</div>
     `;
     refsListEl.appendChild(card);
   }
@@ -468,23 +492,18 @@ async function loadChapter(bookSlug, chapter) {
     ? `${bookInfo.name} ${chapter}`
     : `${bookSlug} ${chapter}`;
 
-  let bookData;
+  let chData;
   try {
-    if (!bookCache.has(bookSlug)) {
-      bookCache.set(bookSlug, await fetchJSON(`${DATA_ROOT}/bible/${bookSlug}.json.zst`));
-    }
-    bookData = bookCache.get(bookSlug);
+    chData = await loadChapterData(bookSlug, chapter);
   } catch (err) {
     refsListEl.innerHTML = `<p class="no-refs">Could not load chapter data. Have you run the builder?</p>`;
     return;
   }
 
-  const chData = bookData.chapters.find(c => c.ch === chapter);
-  await loadPassages();
-  renderChapter(bookData, chData);
+  renderChapter(chData);
 }
 
-function renderChapter(bookData, chData) {
+function renderChapter(chData) {
   if (!chData || !chData.refs.length) {
     refsListEl.innerHTML = `<p class="no-refs">No references found for this chapter.</p>`;
     return;
@@ -517,8 +536,9 @@ function renderChapter(bookData, chData) {
       : `<span class="ref-verse-tag">whole chapter</span>`;
 
     const yearStr = work.year ? ` (${work.year})` : "";
-    const ccelLink = work.ccel_url
-      ? ` <a href="${esc(work.ccel_url)}" target="_blank" rel="noopener" class="ccel-link">View on CCEL ↗</a>`
+    const pageUrl = ccelPageUrl(work.ccel_url, ref.ca);
+    const ccelLink = pageUrl
+      ? ` <a href="${esc(pageUrl)}" target="_blank" rel="noopener" class="ccel-link">View on CCEL ↗</a>`
       : "";
 
     card.innerHTML = `
@@ -529,7 +549,7 @@ function renderChapter(bookData, chData) {
         </div>
         ${verseTag}
       </div>
-      <div class="ref-text">${highlightPassage(passagesData[ref.p], activeChapter, ref.v)}</div>
+      <div class="ref-text">${highlightPassage(ref.t, activeChapter, ref.v)}</div>
     `;
     refsListEl.appendChild(card);
   }
@@ -599,12 +619,10 @@ function applyFilters() {
   if (activeChapter !== null) {
     if (activeVerse === null) {
       // Re-render verse table with updated category counts
-      const bookData = bookCache.get(activeBook);
-      if (bookData) {
-        const chData = bookData.chapters.find(c => c.ch === activeChapter);
-        const kjvChapter = kjvData?.[activeBook]?.[String(activeChapter)] ?? null;
-        renderVerseTable(bookData, chData, kjvChapter);
-      }
+      const book = activeBook, ch = activeChapter;
+      Promise.all([loadChapterData(book, ch), loadKJVBook(book)])
+        .then(([chData, kjv]) => renderVerseTable(chData, kjv?.[String(ch)] ?? null))
+        .catch(() => {});
     } else {
       applyCombinedFilter();
     }
@@ -664,7 +682,6 @@ async function loadWork(workId) {
     return;
   }
 
-  await loadPassages();
   renderWork(data);
 }
 
@@ -696,29 +713,77 @@ function renderWork(data) {
     return;
   }
 
+  workTextObserver?.disconnect();
+  const cardsByChapter = new Map(); // "slug/ch" → [{card, ref}] awaiting text
+  workTextObserver = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const key = e.target.dataset.chapterKey;
+      const pending = cardsByChapter.get(key);
+      if (!pending) continue;
+      cardsByChapter.delete(key);
+      fillWorkCardText(key, pending, workTextObserver);
+    }
+  }, { rootMargin: "800px 0px" });
+
   for (const ref of data.refs) {
     const card = document.createElement("article");
     card.className = "ref-card";
     card.dataset.book = ref.book;
+    const chapterKey = `${ref.book_slug}/${ref.chapter}`;
+    card.dataset.chapterKey = chapterKey;
+    if (!cardsByChapter.has(chapterKey)) cardsByChapter.set(chapterKey, []);
+    cardsByChapter.get(chapterKey).push({ card, ref });
 
     const locTag = ref.v
       ? `<span class="ref-verse-tag">${esc(ref.book)} ${ref.chapter}:${esc(ref.v)}</span>`
       : `<span class="ref-verse-tag">${esc(ref.book)} ${ref.chapter}</span>`;
 
+    const pageUrl = ccelPageUrl(data.ccel_url, ref.ca);
+    const ccelLink = pageUrl
+      ? ` <a href="${esc(pageUrl)}" target="_blank" rel="noopener" class="ccel-link">View on CCEL ↗</a>`
+      : "";
+
     card.innerHTML = `
       <div class="ref-meta">
         <div>
           <span class="ref-author">${esc(data.author)}</span>
-          <span class="ref-work"> — ${esc(data.title)}</span>
+          <span class="ref-work"> — ${esc(data.title)}</span>${ccelLink}
         </div>
         ${locTag}
       </div>
-      <div class="ref-text">${highlightPassage(passagesData[ref.p], ref.chapter, ref.v)}</div>
+      <div class="ref-text loading">Loading passage…</div>
     `;
     workRefsListEl.appendChild(card);
+    workTextObserver.observe(card);
   }
 
   applyBookFilter();
+}
+
+// Observes work-view cards; replaced on each renderWork so stale fetches can tell.
+let workTextObserver = null;
+
+// Fill every pending card for one chapter from that chapter's file; work refs
+// carry the index of their passage within the chapter file's refs array.
+async function fillWorkCardText(chapterKey, pending, observer) {
+  const [slug, ch] = chapterKey.split("/");
+  let chData;
+  try {
+    chData = await loadChapterData(slug, ch);
+  } catch {
+    chData = null;
+  }
+  if (observer !== workTextObserver) return; // user moved on to another work
+  for (const { card, ref } of pending) {
+    observer.unobserve(card);
+    const el = card.querySelector(".ref-text");
+    el.classList.remove("loading");
+    const text = chData?.refs[ref.i]?.t;
+    el.innerHTML = text != null
+      ? highlightPassage(text, ref.chapter, ref.v)
+      : `<span class="no-refs">Passage text unavailable.</span>`;
+  }
 }
 
 function applyBookFilter() {
@@ -831,17 +896,16 @@ function getCatColors() {
 function renderVizTab() {
   vizViewEl.innerHTML = '';
   const cats = checkedCategories();
-  const version = ++_vizVersion; // snapshot; async chart compares against this
   if (!cats.size) {
     vizViewEl.innerHTML = '<p class="no-refs" style="padding:.5rem 0">No categories selected.</p>';
     return;
   }
-  renderWormtrail(cats, version);       // async, fills in after data loads
+  renderWormtrail(cats);
   renderTopChaptersChart(cats);
   renderBibleHeatmap(cats);
   renderTopBooksChart(cats);
   renderWorksTimeline(cats);
-  renderBibleRefsByDate(cats, version); // async, fills in after data loads
+  renderBibleRefsByDate(cats);
   renderCategoryDonut(cats);
 }
 
@@ -859,6 +923,7 @@ function makeVizSection(title) {
 
 // Navigate from viz to a book — auto-loads the first chapter that has references
 function navigateToBook(slug) {
+  closeSidebar();
   const book = index.books.find(b => b.slug === slug);
   const cats = checkedCategories();
   const firstCh = book?.chapters.find(ch => filteredCount(ch, cats) > 0);
@@ -878,6 +943,7 @@ function navigateToBook(slug) {
 
 // Navigate from viz to a specific work in Works mode
 function navigateToWork(workId) {
+  closeSidebar();
   // Pre-set activeWorkId so setMode shows the work panel rather than the welcome screen
   activeWorkId = workId;
   setMode('works');   // Restores sidebar, hides viz panel
@@ -886,6 +952,7 @@ function navigateToWork(workId) {
 
 // Navigate from viz to a specific chapter
 function navigateToChapter(slug, ch) {
+  closeSidebar();
   activeBook = slug;
   activeChapter = ch;
   setMode('scripture');
@@ -928,7 +995,7 @@ function renderTopChaptersChart(cats) {
   const ROW_H = 28, LBL_W = 145, BAR_MAX = 380, SVG_W = LBL_W + BAR_MAX + 55;
   const SVG_H = top.length * ROW_H + 8;
 
-  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}">`];
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%">`];
 
   for (let i = 0; i < top.length; i++) {
     const item = top[i];
@@ -1018,7 +1085,7 @@ function renderTopBooksChart(cats) {
   const ROW_H = 28, LBL_W = 145, BAR_MAX = 380, SVG_W = LBL_W + BAR_MAX + 55;
   const SVG_H = bookData.length * ROW_H + 8;
 
-  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}">`];
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%">`];
 
   for (let i = 0; i < bookData.length; i++) {
     const book = bookData[i];
@@ -1087,7 +1154,7 @@ function renderWorksTimeline(cats) {
     const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
     const tickStep = [1, 2, 5, 10].map(n => n * mag).find(s => yearSpan / s <= 8 && yearSpan / s >= 2) || mag * 10;
 
-    let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}">`];
+    let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%">`];
 
     // Alternating band backgrounds
     for (let i = 0; i < catList.length; i++) {
@@ -1140,24 +1207,6 @@ function renderWorksTimeline(cats) {
 
 // ── 4. Bible References by Date ───────────────────────────────────────────────
 
-// Incremented each time renderVizTab() fires; lets async renders detect staleness.
-let _vizVersion = 0;
-
-// Cache: workId → refs array (passages discarded to save memory)
-const workRefsCache = new Map();
-
-async function fetchWorkRefs(workId) {
-  if (workRefsCache.has(workId)) return workRefsCache.get(workId);
-  try {
-    const data = await fetchJSON(`${DATA_ROOT}/manuscripts/${workId}.json.zst`);
-    workRefsCache.set(workId, data.refs);
-    return data.refs;
-  } catch {
-    workRefsCache.set(workId, []);
-    return [];
-  }
-}
-
 // Maps every slug in the Protestant canon to a display group.
 // Anything unrecognised (deuterocanonical books, etc.) falls back to 'Deuterocanon'.
 const BOOK_GROUP_MAP = new Map([
@@ -1201,7 +1250,7 @@ const BOOK_GROUP_COLORS = new Map([
   ['Revelation',     '#8a3a3a'],
 ]);
 
-async function renderBibleRefsByDate(cats, version) {
+function renderBibleRefsByDate(cats) {
   const sec = makeVizSection('Bible References by Date');
 
   const worksWithYear = index.works
@@ -1213,32 +1262,14 @@ async function renderBibleRefsByDate(cats, version) {
     return;
   }
 
-  // Only show a loading indicator when some works aren't cached yet
-  const uncachedCount = worksWithYear.filter(w => !workRefsCache.has(w.id)).length;
-  let loadingEl = null;
-  if (uncachedCount > 0) {
-    loadingEl = document.createElement('p');
-    loadingEl.className = 'loading';
-    loadingEl.textContent = `Loading citation data for ${uncachedCount} work${uncachedCount !== 1 ? 's' : ''}…`;
-    sec.appendChild(loadingEl);
-  }
-
-  // Fetch all work ref lists in parallel (cached after first load)
-  const workRefsData = await Promise.all(
-    worksWithYear.map(async w => {
-      const refs = await fetchWorkRefs(w.id);
-      const groupCounts = new Map();
-      for (const ref of refs) {
-        const group = BOOK_GROUP_MAP.get(ref.book_slug) ?? 'Deuterocanon';
-        groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
-      }
-      return { work: w, groupCounts };
-    })
-  );
-
-  // Abort if a newer renderVizTab() call has already replaced us
-  if (_vizVersion !== version) return;
-  if (loadingEl) loadingEl.remove();
+  const workRefsData = worksWithYear.map(w => {
+    const groupCounts = new Map();
+    for (const [slug, n] of Object.entries(w.book_counts || {})) {
+      const group = BOOK_GROUP_MAP.get(slug) ?? 'Deuterocanon';
+      groupCounts.set(group, (groupCounts.get(group) || 0) + n);
+    }
+    return { work: w, groupCounts };
+  });
 
   const activeGroups = BOOK_GROUP_ORDER.filter(g =>
     workRefsData.some(d => d.groupCounts.has(g))
@@ -1296,7 +1327,7 @@ async function renderBibleRefsByDate(cats, version) {
   const BAR_GAP  = Math.max(1, Math.min(5, BAR_SLOT * 0.07));
   const BAR_W    = BAR_SLOT - BAR_GAP;
 
-  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}">`];
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%">`];
 
   // Horizontal gridlines at 25 / 50 / 75 / 100 %
   for (const pct of [25, 50, 75, 100]) {
@@ -1354,7 +1385,7 @@ async function renderBibleRefsByDate(cats, version) {
 
 const WORM_TOP_N = 20; // most-cited books to show
 
-async function renderWormtrail(cats, version) {
+function renderWormtrail(cats) {
   const sec = makeVizSection('Citation Wormtrail');
 
   const worksWithYear = index.works
@@ -1366,28 +1397,8 @@ async function renderWormtrail(cats, version) {
     return;
   }
 
-  const uncachedCount = worksWithYear.filter(w => !workRefsCache.has(w.id)).length;
-  let loadingEl = null;
-  if (uncachedCount > 0) {
-    loadingEl = document.createElement('p');
-    loadingEl.className = 'loading';
-    loadingEl.textContent = `Loading citation data for ${uncachedCount} work${uncachedCount !== 1 ? 's' : ''}…`;
-    sec.appendChild(loadingEl);
-  }
-
-  const workRefsData = await Promise.all(
-    worksWithYear.map(async w => {
-      const refs = await fetchWorkRefs(w.id);
-      const bookCounts = new Map();
-      for (const ref of refs) {
-        bookCounts.set(ref.book_slug, (bookCounts.get(ref.book_slug) || 0) + 1);
-      }
-      return { work: w, bookCounts };
-    })
-  );
-
-  if (_vizVersion !== version) return;
-  if (loadingEl) loadingEl.remove();
+  const workRefsData = worksWithYear.map(w =>
+    ({ work: w, bookCounts: new Map(Object.entries(w.book_counts || {})) }));
 
   const minYear  = Math.min(...worksWithYear.map(w => w.year));
   const maxYear  = Math.max(...worksWithYear.map(w => w.year));
@@ -1497,7 +1508,7 @@ async function renderWormtrail(cats, version) {
     return d + ' Z';
   }
 
-  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" style="font-family:Georgia,serif">`];
+  let s = [`<svg class="viz-svg" viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%" style="font-family:Georgia,serif">`];
 
   // Streams
   for (let bi = 0; bi < books.length; bi++) {
@@ -1639,10 +1650,11 @@ async function restoreFromHash(hash) {
       } else if (verseKey) {
         // Show the verse table first so the UI has a back destination, then the filtered view
         await showVerseView(slug, chapter);
-        const bookData    = bookCache.get(slug);
-        const kjvChapter  = kjvData?.[slug]?.[String(chapter)] ?? null;
-        const chData      = bookData?.chapters.find(c => c.ch === chapter);
-        if (chData) await loadChapterFiltered(bookData, chData, verseKey, kjvChapter);
+        const [chData, kjv] = await Promise.all([
+          loadChapterData(slug, chapter).catch(() => null),
+          loadKJVBook(slug),
+        ]);
+        if (chData) loadChapterFiltered(chData, verseKey, kjv?.[String(chapter)] ?? null);
       } else {
         await showVerseView(slug, chapter);
       }
@@ -1684,8 +1696,6 @@ async function init() {
 
   for (const w of index.works) worksById.set(w.id, w);
 
-  loadPassages(); // start fetching in background; awaited before first citation render
-
   renderCategoryFilters();
   renderSidebar();
   renderWorksList();
@@ -1698,7 +1708,7 @@ async function init() {
     setMode('viz');
   }
 
-  passagesLoadPromise.then(dismissSpinner, dismissSpinner);
+  dismissSpinner();
 }
 
 searchEl.addEventListener("input", () => renderSidebar(searchEl.value));
